@@ -1,5 +1,3 @@
-# tensor_network_generator.py
-
 import numpy as np
 import networkx as nx
 import random

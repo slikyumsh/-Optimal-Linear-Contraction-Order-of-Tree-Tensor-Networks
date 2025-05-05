@@ -1,5 +1,3 @@
-# run_experiments.py
-
 import time
 import random
 import numpy as np

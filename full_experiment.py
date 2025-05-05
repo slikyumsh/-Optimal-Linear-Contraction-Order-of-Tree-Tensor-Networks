@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# full_experiment.py
-
 import time
 import random
 import numpy as np
