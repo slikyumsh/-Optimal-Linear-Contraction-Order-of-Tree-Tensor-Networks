@@ -1,11 +1,11 @@
-import os
-os.environ["PYTHONWARNINGS"] = "ignore"
-
 import time
 import random
 import numpy as np
 import opt_einsum as oe
 import cotengra as ctg
+import networkx as nx
+import warnings
+
 from tensor_network_generator import (
     generate_tree_topology,
     generate_random_graph,
@@ -13,20 +13,31 @@ from tensor_network_generator import (
     build_einsum_inputs
 )
 
+def extract_cost(info):
+    """
+    Пробуем достать из PathInfo сначала opt_cost, потом другие поля.
+    """
+    if hasattr(info, 'opt_cost'):
+        return info.opt_cost
+    if hasattr(info, 'flops'):
+        return info.flops
+    if hasattr(info, 'total_cost'):
+        return info.total_cost
+    raise RuntimeError("Не удалось извлечь число флопов из PathInfo")
 
 def run_opt_einsum_greedy(expr, tensors):
     start = time.time()
-    path_info = oe.contract_path(expr, *tensors, optimize='greedy')[1]
+    path, info = oe.contract_path(expr, *tensors, optimize='greedy')
+    cost = extract_cost(info)
     end = time.time()
-    return {"name": "opt_einsum.greedy", "cost": path_info.opt_cost, "time": end - start}
-
+    return {"name": "opt_einsum.greedy", "cost": cost, "time": end - start}
 
 def run_opt_einsum_dp(expr, tensors):
     start = time.time()
-    path_info = oe.contract_path(expr, *tensors, optimize='dynamic-programming')[1]
+    path, info = oe.contract_path(expr, *tensors, optimize='dynamic-programming')
+    cost = extract_cost(info)
     end = time.time()
-    return {"name": "opt_einsum.dp", "cost": path_info.opt_cost, "time": end - start}
-
+    return {"name": "opt_einsum.dp", "cost": cost, "time": end - start}
 
 def run_cotengra_hyper(expr, tensors):
     size_dict = {}
@@ -34,18 +45,19 @@ def run_cotengra_hyper(expr, tensors):
 
     for subs, tensor in zip(input_subscripts, tensors):
         for idx, dim in zip(subs, tensor.shape):
-            if idx in size_dict and size_dict[idx] != dim:
-                raise ValueError(f"Inconsistent dimension for index '{idx}': {size_dict[idx]} vs {dim}")
-            size_dict[idx] = dim
+            if idx in size_dict:
+                if size_dict[idx] != dim:
+                    raise ValueError(f"Inconsistent dimension for index '{idx}': {size_dict[idx]} vs {dim}")
+            else:
+                size_dict[idx] = dim
 
     opt = ctg.HyperOptimizer(methods=['greedy', 'labels'])
 
     start = time.time()
     try:
-        path_info = opt.search(expr, size_dict)
-        cost = float(path_info.get('flops', float('inf')))
+        path_info = opt.search(input_subscripts, expr.split('->')[1], size_dict)
+        cost = float(path_info.get_total_cost())
     except Exception:
-        print("⚠️  Cotengra failed to return a valid cost.")
         cost = float('inf')
     end = time.time()
 
@@ -55,58 +67,64 @@ def run_cotengra_hyper(expr, tensors):
         "time": end - start
     }
 
+def compute_subtree_cost(node, T, subscripts_map, size_dict):
+    children = list(T.successors(node))
+    if not children:
+        indices = subscripts_map[node]
+        size = np.prod([size_dict[i] for i in indices])
+        return set(indices), size, 0
 
-def log_to_csv(results, n_nodes, tree, filename="results.csv"):
-    import csv
-    file_exists = os.path.isfile(filename)
-    with open(filename, mode='a', newline='') as file:
-        writer = csv.DictWriter(file, fieldnames=["n_nodes", "tree", "method", "cost", "time"])
-        if not file_exists:
-            writer.writeheader()
-        for r in results:
-            writer.writerow({
-                "n_nodes": n_nodes,
-                "tree": tree,
-                "method": r["name"],
-                "cost": r["cost"],
-                "time": r["time"]
-            })
+    total_cost = 0
+    current_indices = set(subscripts_map[node])
+    for child in children:
+        idxs, sz, cost = compute_subtree_cost(child, T, subscripts_map, size_dict)
+        total_cost += cost
+        current_indices |= idxs
 
+    current_size = np.prod([size_dict[i] for i in current_indices])
+    total_cost += current_size
 
-def plot_results(filename="results.csv"):
-    import pandas as pd
-    import matplotlib.pyplot as plt
+    return current_indices, current_size, total_cost
 
-    df = pd.read_csv(filename)
+def run_tensor_ikkbz(expr, tensors, G):
+    start = time.time()
 
-    for metric in ['cost', 'time']:
-        plt.figure()
-        for (tree, method), group in df.groupby(['tree', 'method']):
-            label = f"{'Tree' if tree else 'Graph'} | {method}"
-            plt.plot(group['n_nodes'], group[metric], marker='o', label=label)
-        plt.xlabel('Number of Nodes')
-        plt.ylabel(metric.capitalize())
-        plt.title(f"{metric.capitalize()} by Method")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(f"{metric}_plot.png")
-        plt.close()
+    if not nx.is_tree(G):
+        raise ValueError("TensorIKKBZ применяется только к деревьям!")
 
+    root = list(G.nodes())[0]
+    T = nx.dfs_tree(G, source=root)
+
+    input_subscripts = expr.split('->')[0].split(',')
+    size_dict = {}
+    for subs, t in zip(input_subscripts, tensors):
+        for i, dim in zip(subs, t.shape):
+            if i not in size_dict:
+                size_dict[i] = dim
+            elif size_dict[i] != dim:
+                raise ValueError(f"Inconsistent dimension for index {i}: {size_dict[i]} vs {dim}")
+
+    subscripts_map = dict(zip(G.nodes(), input_subscripts))
+    _, _, cost = compute_subtree_cost(root, T, subscripts_map, size_dict)
+
+    end = time.time()
+    return {
+        "name": "tensor.ikkbz",
+        "cost": cost,
+        "time": end - start
+    }
 
 def run_single_experiment(n_nodes=8, tree=True, seed=42):
     random.seed(seed)
     np.random.seed(seed)
+    warnings.filterwarnings("ignore")
 
-    if tree:
-        G = generate_tree_topology(n_nodes)
-    else:
-        G = generate_random_graph(n_nodes, edge_prob=0.4)
-
+    G = generate_tree_topology(n_nodes) if tree else generate_random_graph(n_nodes, edge_prob=0.4)
     edge_legs, edge_sizes = assign_legs_and_sizes(G)
     expr, tensors = build_einsum_inputs(G, edge_legs, edge_sizes)
 
     print(f"\nEinsum expression: {expr}")
+
     results = []
 
     try:
@@ -124,19 +142,15 @@ def run_single_experiment(n_nodes=8, tree=True, seed=42):
     except Exception as e:
         print("Cotengra Hyper failed:", e)
 
+    if tree:
+        try:
+            results.append(run_tensor_ikkbz(expr, tensors, G))
+        except Exception as e:
+            print("TensorIKKBZ failed:", e)
+
     for r in results:
         print(f"{r['name']:20} | Cost: {r['cost']:.2e} | Time: {r['time']:.4f} sec")
 
-    log_to_csv(results, n_nodes, tree)
-
-
 if __name__ == "__main__":
-    # Очистим старый файл результатов
-    if os.path.exists("results.csv"):
-        os.remove("results.csv")
-
-    for tree in [True, False]:
-        for n in range(5, 11):
-            run_single_experiment(n_nodes=n, tree=tree)
-
-    plot_results()
+    run_single_experiment(n_nodes=10, tree=True)   # дерево
+    run_single_experiment(n_nodes=10, tree=False)  # недерево
