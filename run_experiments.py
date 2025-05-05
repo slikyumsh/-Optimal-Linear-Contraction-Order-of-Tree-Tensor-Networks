@@ -1,3 +1,5 @@
+# run_experiments.py
+
 import time
 import random
 import numpy as np
@@ -5,6 +7,8 @@ import opt_einsum as oe
 import cotengra as ctg
 import networkx as nx
 import warnings
+import heapq
+import itertools
 
 from tensor_network_generator import (
     generate_tree_topology,
@@ -14,105 +18,134 @@ from tensor_network_generator import (
 )
 
 def extract_cost(info):
-    """
-    Пробуем достать из PathInfo сначала opt_cost, потом другие поля.
-    """
-    if hasattr(info, 'opt_cost'):
-        return info.opt_cost
-    if hasattr(info, 'flops'):
-        return info.flops
-    if hasattr(info, 'total_cost'):
-        return info.total_cost
-    raise RuntimeError("Не удалось извлечь число флопов из PathInfo")
+    """Извлекает числовую оценку флопов из PathInfo."""
+    for attr in ('opt_cost','cost','flops','total_cost'):
+        if hasattr(info, attr):
+            return getattr(info, attr)
+    raise RuntimeError(f"Не удалось извлечь число флопов из PathInfo: {info}")
 
-def run_opt_einsum_greedy(expr, tensors):
-    start = time.time()
-    path, info = oe.contract_path(expr, *tensors, optimize='greedy')
-    cost = extract_cost(info)
-    end = time.time()
-    return {"name": "opt_einsum.greedy", "cost": cost, "time": end - start}
-
-def run_opt_einsum_dp(expr, tensors):
-    start = time.time()
-    path, info = oe.contract_path(expr, *tensors, optimize='dynamic-programming')
-    cost = extract_cost(info)
-    end = time.time()
-    return {"name": "opt_einsum.dp", "cost": cost, "time": end - start}
+def run_opt_einsum(expr, tensors, method):
+    t0 = time.time()
+    _, info = oe.contract_path(expr, *tensors, optimize=method)
+    return extract_cost(info), time.time() - t0
 
 def run_cotengra_hyper(expr, tensors):
-    size_dict = {}
-    input_subscripts = expr.split('->')[0].split(',')
+    # Собираем size_dict
+    inp, out = expr.split('->')
+    inputs = inp.split(',')
+    size_dict = {idx:dim for subs,t in zip(inputs,tensors) for idx,dim in zip(subs,t.shape)}
 
-    for subs, tensor in zip(input_subscripts, tensors):
-        for idx, dim in zip(subs, tensor.shape):
-            if idx in size_dict:
-                if size_dict[idx] != dim:
-                    raise ValueError(f"Inconsistent dimension for index '{idx}': {size_dict[idx]} vs {dim}")
-            else:
-                size_dict[idx] = dim
+    opt = ctg.HyperOptimizer(methods=['kahypar','greedy','labels'])
+    t0 = time.time()
+    tree = opt.search(inputs, out, size_dict)
+    cost = int(tree.contraction_cost())
+    return cost, time.time() - t0
 
-    opt = ctg.HyperOptimizer(methods=['greedy', 'labels'])
+def tensor_ikkbz(G, edge_legs, edge_sizes):
+    """
+    Двухфазный ASI TensorIKKBZ из статьи.
+    Возвращает (total_cost, order).
+    """
+    # 1) Root tree at 0
+    root = 0
+    T = nx.dfs_tree(G, source=root)          # directed parent->child
+    parent = {v:p for p,v in T.edges()}
 
-    start = time.time()
-    try:
-        path_info = opt.search(input_subscripts, expr.split('->')[1], size_dict)
-        cost = float(path_info.get_total_cost())
-    except Exception:
-        cost = float('inf')
-    end = time.time()
+    # 2) cluster_edges хранит лейблы текущих рёбер между кластерами
+    cluster_edges = dict(edge_legs)
+    size_dict = dict(edge_sizes)
 
-    return {
-        "name": "cotengra.hyper",
-        "cost": cost,
-        "time": end - start
-    }
+    # 3) Рекурсивный подсчёт: возвращает (full_C, idxs, merge_cost)
+    def summarize_subtree(v, p):
+        full_C = 0
+        # текущие индексы v: к родителю (если есть) и ко всем детям
+        neighbors = []
+        if p is not None: neighbors.append(p)
+        children = list(T.successors(v))
+        neighbors += children
 
-def compute_subtree_cost(node, T, subscripts_map, size_dict):
-    children = list(T.successors(node))
-    if not children:
-        indices = subscripts_map[node]
-        size = np.prod([size_dict[i] for i in indices])
-        return set(indices), size, 0
+        idxs = set(cluster_edges[(v,u)] for u in neighbors)
+        # рекурсивно добавляем детей
+        for w in children:
+            child_full, child_idxs, child_merge = summarize_subtree(w, v)
+            full_C += child_full
+            idxs |= child_idxs
+
+        # локальный merge_cost v->p
+        if p is None:
+            merge_cost = 0
+        else:
+            par_leg = cluster_edges[(v,p)]
+            # индексы без ребра к родителю
+            no_par = idxs - {par_leg}
+            T_size = np.prod([size_dict[i] for i in no_par]) if no_par else 1
+            merge_cost = T_size * size_dict[par_leg]
+
+        full_C += merge_cost
+        return full_C, idxs, merge_cost
+
+    # 4) Строим min-кучу по ASI-score для каждого v->parent
+    REMOVED = object()
+    entry_finder = {}
+    heap = []
+    counter = itertools.count()
+
+    def add_or_update(v):
+        p = parent.get(v)
+        if p is None:
+            return
+        full_C, idxs, merge_cost = summarize_subtree(v, p)
+        par_leg = cluster_edges[(v,p)]
+        no_par = idxs - {par_leg}
+        size_no_par = np.prod([size_dict[i] for i in no_par]) if no_par else 1
+        sigma = (full_C, size_dict[par_leg] - size_no_par)
+        # ключ = full_C / (|sigma2| or 1)
+        key = full_C / max(1, abs(sigma[1]))
+        entry = [key, next(counter), v, sigma]
+        if v in entry_finder:
+            entry_finder[v][2] = REMOVED
+        entry_finder[v] = entry
+        heapq.heappush(heap, entry)
+
+    for v in G.nodes():
+        add_or_update(v)
 
     total_cost = 0
-    current_indices = set(subscripts_map[node])
-    for child in children:
-        idxs, sz, cost = compute_subtree_cost(child, T, subscripts_map, size_dict)
-        total_cost += cost
-        current_indices |= idxs
+    order = []
+    active = set(G.nodes())
 
-    current_size = np.prod([size_dict[i] for i in current_indices])
-    total_cost += current_size
+    # 5) Основной цикл слияний
+    while len(active) > 1:
+        key, _, v, sigma = heapq.heappop(heap)
+        if v is REMOVED or v not in active:
+            continue
+        p = parent[v]
+        # берём только локальную merge_cost
+        _, _, merge_cost = summarize_subtree(v, p)
+        total_cost += merge_cost
+        order.append((v,p))
+        active.remove(v)
 
-    return current_indices, current_size, total_cost
+        # переназначаем детей v -> p
+        for w in list(T.successors(v)):
+            lbl = cluster_edges[(w,v)]
+            cluster_edges[(w,p)] = lbl
+            cluster_edges[(p,w)] = lbl
+            parent[w] = p
+            T.add_edge(p,w)
+        T.remove_node(v)
 
-def run_tensor_ikkbz(expr, tensors, G):
-    start = time.time()
+        # обновляем приоритеты p и его детей
+        add_or_update(p)
+        for w in T.successors(p):
+            add_or_update(w)
 
-    if not nx.is_tree(G):
-        raise ValueError("TensorIKKBZ применяется только к деревьям!")
+    return total_cost, order
 
-    root = list(G.nodes())[0]
-    T = nx.dfs_tree(G, source=root)
-
-    input_subscripts = expr.split('->')[0].split(',')
-    size_dict = {}
-    for subs, t in zip(input_subscripts, tensors):
-        for i, dim in zip(subs, t.shape):
-            if i not in size_dict:
-                size_dict[i] = dim
-            elif size_dict[i] != dim:
-                raise ValueError(f"Inconsistent dimension for index {i}: {size_dict[i]} vs {dim}")
-
-    subscripts_map = dict(zip(G.nodes(), input_subscripts))
-    _, _, cost = compute_subtree_cost(root, T, subscripts_map, size_dict)
-
-    end = time.time()
-    return {
-        "name": "tensor.ikkbz",
-        "cost": cost,
-        "time": end - start
-    }
+def run_tensor_ikkbz(G, edge_legs, edge_sizes):
+    t0 = time.time()
+    cost, order = tensor_ikkbz(G, edge_legs, edge_sizes)
+    return cost, time.time() - t0
 
 def run_single_experiment(n_nodes=8, tree=True, seed=42):
     random.seed(seed)
@@ -124,33 +157,24 @@ def run_single_experiment(n_nodes=8, tree=True, seed=42):
     expr, tensors = build_einsum_inputs(G, edge_legs, edge_sizes)
 
     print(f"\nEinsum expression: {expr}")
-
     results = []
 
-    try:
-        results.append(run_opt_einsum_greedy(expr, tensors))
-    except Exception as e:
-        print("Greedy failed:", e)
+    cg, tg = run_opt_einsum(expr, tensors, 'greedy')
+    results.append({"name":"opt_einsum.greedy","cost":cg,"time":tg})
 
-    try:
-        results.append(run_opt_einsum_dp(expr, tensors))
-    except Exception as e:
-        print("DP failed:", e)
+    cd, td = run_opt_einsum(expr, tensors, 'dynamic-programming')
+    results.append({"name":"opt_einsum.dp",    "cost":cd,"time":td})
 
-    try:
-        results.append(run_cotengra_hyper(expr, tensors))
-    except Exception as e:
-        print("Cotengra Hyper failed:", e)
+    ch, th = run_cotengra_hyper(expr, tensors)
+    results.append({"name":"cotengra.hyper",   "cost":ch,"time":th})
 
     if tree:
-        try:
-            results.append(run_tensor_ikkbz(expr, tensors, G))
-        except Exception as e:
-            print("TensorIKKBZ failed:", e)
+        ci, ti = run_tensor_ikkbz(G, edge_legs, edge_sizes)
+        results.append({"name":"tensor.ikkbz",    "cost":ci,"time":ti})
 
     for r in results:
         print(f"{r['name']:20} | Cost: {r['cost']:.2e} | Time: {r['time']:.4f} sec")
 
 if __name__ == "__main__":
-    run_single_experiment(n_nodes=10, tree=True)   # дерево
-    run_single_experiment(n_nodes=10, tree=False)  # недерево
+    run_single_experiment(n_nodes=10, tree=True)
+    run_single_experiment(n_nodes=10, tree=False)
